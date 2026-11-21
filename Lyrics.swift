@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import CoreImage
 
 // MARK: - Data
 
@@ -65,17 +66,25 @@ func isRunning(_ id: String) -> Bool { !NSRunningApplication.runningApplications
 
 func num(_ s: String) -> Double { Double(s.replacingOccurrences(of: ",", with: ".")) ?? 0 }
 
-// (bundle id, name, duration divisor, AppleScript expression for artwork URL)
-let nativePlayers = [("com.apple.Music", "Music", 1.0, "\"\""), ("com.spotify.client", "Spotify", 1000.0, "artwork url of t")]
+/// Shuffle / repeat / volume. nil = this player doesn't support it (the button is hidden).
+struct Extras: Equatable { var shuffle: Bool?; var repeatMode: String?; var volume: Double? }
+
+// (bundle id, name, duration divisor, artwork URL expression, "shuffle, repeat, volume" expression)
+let nativePlayers = [
+    ("com.apple.Music", "Music", 1.0, "\"\"",
+     "(shuffle enabled as text) & linefeed & (song repeat as text) & linefeed & (sound volume as text)"),
+    ("com.spotify.client", "Spotify", 1000.0, "artwork url of t",
+     "(shuffling as text) & linefeed & (repeating as text) & linefeed & (sound volume as text)"),
+]
 let chromiums = [("com.google.Chrome", "Chrome"), ("com.brave.Browser", "Brave"), ("com.microsoft.edgemac", "Edge")]
 
-func nativeScript(_ id: String, art: String) -> String {
+func nativeScript(_ id: String, art: String, extras: String) -> String {
     """
     tell application id "\(id)"
       try
         if player state is not playing then return ""
         set t to current track
-        return (name of t) & linefeed & (artist of t) & linefeed & (album of t) & linefeed & ((duration of t) as text) & linefeed & ((player position) as text) & linefeed & (\(art))
+        return (name of t) & linefeed & (artist of t) & linefeed & (album of t) & linefeed & ((duration of t) as text) & linefeed & ((player position) as text) & linefeed & (\(art)) & linefeed & \(extras)
       end try
       return ""
     end tell
@@ -83,7 +92,7 @@ func nativeScript(_ id: String, art: String) -> String {
 }
 
 // Only answers for a YouTube tab whose video is actually playing. No double quotes/backslashes (embedded in AppleScript).
-let ytInfoJS = "(()=>{const v=document.querySelector('video');if(!v||v.paused)return '';const m=navigator.mediaSession&&navigator.mediaSession.metadata;return [(m&&m.title)||document.title.replace(/ - YouTube$/,''),(m&&m.artist)||'',(m&&m.album)||'',v.duration,v.currentTime,(m&&m.artwork&&m.artwork.length)?m.artwork[m.artwork.length-1].src:''].join(String.fromCharCode(10))})()"
+let ytInfoJS = "(()=>{const v=document.querySelector('video');if(!v||v.paused)return '';const m=navigator.mediaSession&&navigator.mediaSession.metadata;return [(m&&m.title)||document.title.replace(/ - YouTube$/,''),(m&&m.artist)||'',(m&&m.album)||'',v.duration,v.currentTime,(m&&m.artwork&&m.artwork.length)?m.artwork[m.artwork.length-1].src:'',Math.round(v.volume*100)].join(String.fromCharCode(10))})()"
 /// Runs `action` (JS using `v`, the video element) in the first YouTube tab with a video, paused or not.
 // ponytail: first YouTube tab wins; track the matched tab id if multiple YouTube tabs cause wrong-tab control.
 func ytJS(_ action: String) -> String { "(()=>{const v=document.querySelector('video');if(!v)return '';\(action);return 'ok'})()" }
@@ -108,34 +117,40 @@ func browserScript(_ id: String, _ js: String) -> String {
 }
 
 /// Returns the currently *playing* track and its position, or nil if nothing is playing.
-func detect() -> (Track, Double)? {
-    for (id, name, durScale, art) in nativePlayers where isRunning(id) {
-        guard let r = runAS(nativeScript(id, art: art)), !r.isEmpty else { continue }
+func detect() -> (Track, Double, Extras)? {
+    for (id, name, durScale, art, extras) in nativePlayers where isRunning(id) {
+        guard let r = runAS(nativeScript(id, art: art, extras: extras)), !r.isEmpty else { continue }
         let f = r.components(separatedBy: "\n")
-        guard f.count >= 6 else { continue }
-        return (Track(title: f[0], artist: f[1], album: f[2], duration: num(f[3]) / durScale, source: name, app: id, artURL: f[5]), num(f[4]))
+        guard f.count >= 9 else { continue }
+        let rep = f[7] == "true" ? "all" : f[7] == "false" ? "off" : f[7]   // Spotify's repeat is a boolean
+        return (Track(title: f[0], artist: f[1], album: f[2], duration: num(f[3]) / durScale, source: name, app: id, artURL: f[5]),
+                num(f[4]), Extras(shuffle: f[6] == "true", repeatMode: rep, volume: num(f[8])))
     }
     for (id, name) in chromiums + [("com.apple.Safari", "Safari")] where isRunning(id) {
         guard let r = runAS(browserScript(id, ytInfoJS)), !r.isEmpty else { continue }
         let f = r.components(separatedBy: "\n")
-        guard f.count >= 6 else { continue }
+        guard f.count >= 7 else { continue }
         var t = ytTrack(title: f[0], channel: f[1], album: f[2], duration: num(f[3]), app: id, source: "YouTube · \(name)")
         t.artURL = f[5]
-        return (t, num(f[4]))
+        return (t, num(f[4]), Extras(volume: num(f[6])))
     }
     return nil
 }
 
-enum Cmd { case playPause, next, previous, seek(Double) }
+enum Cmd { case playPause, next, previous, seek(Double), shuffle(Bool), repeatMode(String), volume(Int) }
 
 func commandScript(_ app: String, _ c: Cmd) -> String {
     if nativePlayers.contains(where: { $0.0 == app }) {
+        let music = app == "com.apple.Music"
         let verb: String
         switch c {
         case .playPause: verb = "playpause"
         case .next: verb = "next track"
         case .previous: verb = "previous track"
         case .seek(let t): verb = "set player position to \(t)"
+        case .shuffle(let b): verb = music ? "set shuffle enabled to \(b)" : "set shuffling to \(b)"
+        case .repeatMode(let r): verb = music ? "set song repeat to \(r)" : "set repeating to \(r != "off")"
+        case .volume(let v): verb = "set sound volume to \(v)"
         }
         return "tell application id \"\(app)\" to \(verb)"
     }
@@ -145,8 +160,26 @@ func commandScript(_ app: String, _ c: Cmd) -> String {
     case .next: js = "const b=document.querySelector('.ytp-next-button,.next-button');if(b)b.click()"
     case .previous: js = "const b=document.querySelector('.previous-button,.ytp-prev-button');if(b)b.click();else v.currentTime=0"
     case .seek(let t): js = "v.currentTime=\(t)"
+    case .volume(let v): js = "v.volume=\(Double(v) / 100)"
+    case .shuffle, .repeatMode: js = "0"   // not supported on YouTube; buttons are hidden
     }
     return browserScript(app, ytJS(js))
+}
+
+/// Accent color for an album: the art's average color, kept light and soft so it reads on the dark blurred background.
+/// Returns hue/saturation/brightness; grey art gives near-white.
+func artTintHSB(_ img: NSImage) -> (h: CGFloat, s: CGFloat, b: CGFloat)? {
+    guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    let ci = CIImage(cgImage: cg)
+    guard let out = CIFilter(name: "CIAreaAverage", parameters: [kCIInputImageKey: ci, kCIInputExtentKey: CIVector(cgRect: ci.extent)])?.outputImage
+    else { return nil }
+    var px = [UInt8](repeating: 0, count: 4)
+    CIContext().render(out, toBitmap: &px, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                       format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
+    let c = NSColor(red: CGFloat(px[0]) / 255, green: CGFloat(px[1]) / 255, blue: CGFloat(px[2]) / 255, alpha: 1)
+    var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0
+    c.getHue(&h, saturation: &s, brightness: &b, alpha: nil)
+    return (h, min(s * 1.3, 0.55), 0.92)
 }
 
 /// Album art URL via the public iTunes Search API (no key) when the player doesn't give one.
@@ -199,9 +232,15 @@ func fetchLyrics(_ t: Track) async -> LR? {
     @Published var current = -1
     @Published var offset = 0.0
     @Published var art: NSImage?
+    @Published var artTint: Color?   // sliders in the wide layout match the album
     @Published private(set) var playing = false
+    @Published var extras = Extras()
 
     private var basePos = 0.0, baseAt = Date(), polling = false
+    private var gen = 0   // bumped on every command; polls from before it are ignored
+    // After play/pause, Music can keep reporting the old state for 0.35s+ (seen in logs). Hold the state the user
+    // asked for until the player confirms it, or this deadline passes.
+    private var expect: (playing: Bool, until: Date)?
     private var cache: [String: LR?] = [:]
     private var stash: (lines: [Line], plain: String?, offset: Double)?   // real lyrics, saved during a draft preview
 
@@ -227,24 +266,30 @@ func fetchLyrics(_ t: Track) async -> LR? {
     func poll() {
         guard !polling else { return }
         polling = true
+        let g = gen
         q.async {
             let r = detect()
-            DispatchQueue.main.async { self.apply(r) }
+            DispatchQueue.main.async { self.apply(r, gen: g) }
         }
     }
 
-    private func apply(_ r: (Track, Double)?) {
+    private func apply(_ r: (Track, Double, Extras)?, gen g: Int) {
         polling = false
-        guard let (t, pos) = r else {      // paused / nothing: freeze, keep lyrics on screen
+        guard g == gen else { return }   // started before the last command: stale, would undo the optimistic UI
+        if let e = expect {
+            if (r != nil) == e.playing || Date() > e.until { expect = nil } else { return }   // player hasn't caught up yet
+        }
+        guard let (t, pos, x) = r else {      // paused / nothing: freeze, keep lyrics on screen
             if playing { basePos = position; playing = false }
             return
         }
         basePos = pos; baseAt = Date(); playing = true
+        if extras != x { extras = x }
         if track?.key != t.key { track = t; load(t) }
     }
 
     private func load(_ t: Track) {
-        lines = []; plain = nil; current = -1; offset = 0; art = nil
+        lines = []; plain = nil; current = -1; offset = 0; art = nil; artTint = nil
         stash = nil   // song changed mid-preview: don't restore the old song's lyrics later
         status = "Searching lyrics…"
         Task {
@@ -252,6 +297,7 @@ func fetchLyrics(_ t: Track) async -> LR? {
             guard let u, let url = URL(string: u), let (d, _) = try? await URLSession.shared.data(from: url),
                   track?.key == t.key else { return }
             art = NSImage(data: d)
+            artTint = art.flatMap(artTintHSB).map { Color(hue: $0.h, saturation: $0.s, brightness: $0.b) }
         }
         Task {
             let r: LR?
@@ -276,19 +322,34 @@ func fetchLyrics(_ t: Track) async -> LR? {
         lines = parseLRC(synced); self.plain = nil; status = ""
     }
 
+    /// off → all → one → off (Spotify has no "one", so off ↔ all).
+    var nextRepeat: String {
+        switch extras.repeatMode {
+        case "off": return "all"
+        case "all": return track?.app == "com.apple.Music" ? "one" : "off"
+        default: return "off"
+        }
+    }
+
     /// Seek so that lyric time `time` lines up (accounts for the offset).
     func seekLyric(_ time: Double) { send(.seek(max(0, time - offset))) }
 
     func send(_ c: Cmd) {
         guard let app = track?.app else { return }
+        gen += 1
         switch c {   // optimistic UI, the next poll corrects it
         case .seek(let t): basePos = t; baseAt = Date()
-        case .playPause: basePos = position; baseAt = Date(); playing.toggle()
+        case .playPause:
+            basePos = position; baseAt = Date(); playing.toggle()
+            expect = (playing, Date().addingTimeInterval(1.5))
+        case .shuffle(let b): extras.shuffle = b
+        case .repeatMode(let r): extras.repeatMode = r
+        case .volume(let v): extras.volume = Double(v)
         default: break
         }
         q.async {
             _ = runAS(commandScript(app, c))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.poll() }
+            DispatchQueue.main.async { self.poll() }
         }
     }
 }
@@ -311,84 +372,178 @@ struct ContentView: View {
     @State var previewing = false
 
     var body: some View {
+        GeometryReader { geo in
+            // Big window / full screen: Apple Music-style art + controls on the left, lyrics on the right.
+            if geo.size.width >= 900 && (editor == nil || previewing) {
+                wide(geo.size)
+            } else {
+                compact.frame(width: geo.size.width, height: geo.size.height).background(Blur().ignoresSafeArea())
+            }
+        }
+        .frame(minWidth: 300, minHeight: 320)
+        .onAppear { setupWindows() }
+        .onChange(of: onTop) { _, _ in setupWindows() }
+    }
+
+    // MARK: pieces shared by both layouts
+
+    var artView: some View {
+        Group {
+            if let a = m.art { Image(nsImage: a).resizable().aspectRatio(contentMode: .fill) }
+            else { Image(systemName: "music.note").font(.title2).foregroundStyle(.secondary) }
+        }
+        .background(.quaternary)
+    }
+
+    var toolbarButtons: some View {
+        HStack(spacing: 12) {
+            Button {
+                if editor == nil { editor = Editor(m) } else { m.endPreview(); previewing = false; editor = nil }
+            } label: { Image(systemName: editor == nil ? "pencil" : "xmark") }
+                .help(editor == nil ? "Sync editor: make synced lyrics for this song" : "Close editor")
+                .disabled(m.track == nil)
+            Button { toggleFullScreen() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                .help("Full screen")
+            Button { onTop.toggle() } label: { Image(systemName: onTop ? "pin.fill" : "pin") }
+                .help(onTop ? "Stay on top: on" : "Stay on top: off")
+        }
+        .buttonStyle(.borderless)
+    }
+
+    @ViewBuilder var previewBanner: some View {
+        if previewing {
+            HStack {
+                Label("Previewing your draft", systemImage: "eye").font(.caption.bold())
+                Spacer()
+                Button("Back to editor") { m.endPreview(); previewing = false; editor?.resume() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.15))
+        }
+    }
+
+    @ViewBuilder func lyricsBody(size: CGFloat, vPad: CGFloat) -> some View {
+        if !m.lines.isEmpty {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: size * 0.6) {
+                        ForEach(m.lines) { l in
+                            Text(l.text.isEmpty ? "♪" : l.text)
+                                .font(.system(size: size, weight: .bold))
+                                .foregroundStyle(l.id == m.current ? Color.primary : Color.secondary)
+                                .opacity(l.id == m.current ? 1 : 0.45)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .onTapGesture { m.seekLyric(l.time) }
+                                .id(l.id)
+                        }
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, vPad)
+                    .animation(.easeOut(duration: 0.2), value: m.current)
+                }
+                .scrollIndicators(.never)
+                .onChange(of: m.current) { _, i in
+                    withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(max(i, 0), anchor: .center) }
+                }
+            }
+        } else if let p = m.plain {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Synced lyrics not available").font(.caption).foregroundStyle(.secondary)
+                    Text(p).font(.system(size: size * 0.8, weight: .semibold)).textSelection(.enabled)
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
+            }
+        } else {
+            VStack {
+                Spacer()
+                Text(m.status).foregroundStyle(.secondary).multilineTextAlignment(.center).padding()
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    // MARK: layouts
+
+    var compact: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                Group {
-                    if let a = m.art { Image(nsImage: a).resizable().aspectRatio(contentMode: .fill) }
-                    else { Image(systemName: "music.note").font(.title2).foregroundStyle(.secondary) }
-                }
-                .frame(width: 64, height: 64).background(.quaternary).clipShape(RoundedRectangle(cornerRadius: 8))
-
+                artView.frame(width: 64, height: 64).clipShape(RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(m.track?.title ?? "Lyrics").font(.headline).lineLimit(1)
                     Text(m.track?.artist ?? "").font(.subheadline).lineLimit(1)
                     Text(m.track?.source ?? "").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
-                Button {
-                    if editor == nil { editor = Editor(m) } else { m.endPreview(); previewing = false; editor = nil }
-                } label: { Image(systemName: editor == nil ? "pencil" : "xmark") }
-                    .help(editor == nil ? "Sync editor: make synced lyrics for this song" : "Close editor")
-                    .disabled(m.track == nil)
-                Button { onTop.toggle() } label: { Image(systemName: onTop ? "pin.fill" : "pin") }
-                    .help(onTop ? "Stay on top: on" : "Stay on top: off")
+                toolbarButtons
             }
-            .buttonStyle(.borderless)
             .padding(.horizontal, 16).padding(.top, 30).padding(.bottom, 8)
 
-            if previewing {
-                HStack {
-                    Label("Previewing your draft", systemImage: "eye").font(.caption.bold())
-                    Spacer()
-                    Button("Back to editor") { m.endPreview(); previewing = false; editor?.resume() }
-                        .buttonStyle(.borderedProminent).controlSize(.small)
-                }
-                .padding(.horizontal, 16).padding(.vertical, 6)
-                .background(Color.accentColor.opacity(0.15))
-            }
+            previewBanner
             if let e = editor, !previewing {
                 EditorView(e: e, m: m, close: { editor = nil }, preview: { m.preview(e.lrc); previewing = true })
-            } else if !m.lines.isEmpty {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 14) {
-                            ForEach(m.lines) { l in
-                                Text(l.text.isEmpty ? "♪" : l.text)
-                                    .font(.system(size: 22, weight: .bold))
-                                    .foregroundStyle(l.id == m.current ? Color.primary : Color.secondary)
-                                    .opacity(l.id == m.current ? 1 : 0.45)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture { m.seekLyric(l.time) }
-                                    .id(l.id)
-                            }
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 200)
-                        .animation(.easeOut(duration: 0.2), value: m.current)
-                    }
-                    .onChange(of: m.current) { _, i in
-                        withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(max(i, 0), anchor: .center) }
-                    }
-                }
-            } else if let p = m.plain {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Synced lyrics not available").font(.caption).foregroundStyle(.secondary)
-                        Text(p).font(.system(size: 18, weight: .semibold)).textSelection(.enabled)
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
-                }
             } else {
-                Spacer()
-                Text(m.status).foregroundStyle(.secondary).multilineTextAlignment(.center).padding()
-                Spacer()
+                lyricsBody(size: 22, vPad: 200)
             }
 
             if m.track != nil { Controls(m: m, spaceKey: editor == nil || previewing).padding(.horizontal, 16).padding(.vertical, 10) }
         }
-        .frame(minWidth: 300, minHeight: 320)
-        .background(Blur().ignoresSafeArea())
-        .onAppear { setupWindows() }
-        .onChange(of: onTop) { _, _ in setupWindows() }
+    }
+
+    func wide(_ s: CGSize) -> some View {
+        let side = min(s.height * 0.5, s.width * 0.3)
+        let subtitle = [m.track?.artist, m.track?.album].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " — ")
+        return HStack(spacing: 56) {
+            VStack(alignment: .leading, spacing: 24) {
+                artView.frame(width: side, height: side)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .shadow(color: .black.opacity(0.4), radius: 30, y: 10)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(m.track?.title ?? "Lyrics").font(.title2.bold()).lineLimit(1)
+                    Text(subtitle).font(.title3).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if m.track != nil { Controls(m: m, spaceKey: editor == nil || previewing, big: true, tint: m.artTint ?? .white) }
+            }
+            .frame(width: side)
+            .frame(maxWidth: .infinity)
+            lyricsBody(size: 34, vPad: s.height * 0.4)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(.horizontal, 56)
+        .frame(width: s.width, height: s.height)
+        .overlay(alignment: .top) {
+            VStack(spacing: 0) {
+                HStack { Spacer(); toolbarButtons }.padding(.horizontal, 20).padding(.top, 12)
+                previewBanner
+            }
+        }
+        .background(artBackground)
+        .environment(\.colorScheme, .dark)
+    }
+
+    /// Apple Music-style background: the album art blown up, blurred and darkened, so the colors come from the art.
+    var artBackground: some View {
+        ZStack {
+            Color.black
+            if let a = m.art {
+                Image(nsImage: a).resizable().aspectRatio(contentMode: .fill)
+                    .blur(radius: 90).saturation(1.3).opacity(0.85)
+                    .id(m.track?.key)
+                    .transition(.opacity)
+            }
+            Color.black.opacity(0.3)
+        }
+        .animation(.easeInOut(duration: 0.8), value: m.art)
+        .clipped()
+        .ignoresSafeArea()
+    }
+
+    // MARK: window
+
+    func toggleFullScreen() {
+        if onTop { onTop = false; setupWindows() }   // floating windows can't go full screen
+        (NSApp.keyWindow ?? NSApp.windows.first)?.toggleFullScreen(nil)
     }
 
     func setupWindows() {
@@ -396,7 +551,13 @@ struct ContentView: View {
             w.level = onTop ? .floating : .normal
             w.isOpaque = false
             w.backgroundColor = .clear
-            if onTop { w.collectionBehavior.insert(.canJoinAllSpaces) } else { w.collectionBehavior.remove(.canJoinAllSpaces) }
+            if onTop {
+                w.collectionBehavior.remove(.fullScreenPrimary)
+                w.collectionBehavior.formUnion([.canJoinAllSpaces, .fullScreenAuxiliary])
+            } else {
+                w.collectionBehavior.subtract([.canJoinAllSpaces, .fullScreenAuxiliary])
+                w.collectionBehavior.insert(.fullScreenPrimary)
+            }
         }
     }
 }
@@ -404,45 +565,103 @@ struct ContentView: View {
 struct Controls: View {
     @ObservedObject var m: Model
     var spaceKey = true                // off while the editor is open so typing spaces works
+    var big = false                    // Apple Music-style: shuffle, repeat, volume, remaining time
+    var tint: Color?                   // slider color; nil = system accent
     @State private var drag: Double?   // scrub position while dragging; seek only on release
+    @State private var vol: Double?    // volume while dragging; set only on release
+
+    func scrubber(_ pos: Double, _ dur: Double) -> some View {
+        Slider(value: Binding(get: { pos }, set: { drag = $0 }), in: 0...(dur.isFinite ? dur : 1)) { editing in
+            if !editing, let d = drag { m.send(.seek(d)); drag = nil }
+        }
+        .controlSize(.small)
+        .tint(tint)
+    }
+
+    var offsetControl: some View {
+        HStack(spacing: 2) {
+            Button("−") { m.offset -= 0.25 }.help("Lyrics earlier")
+            Text(String(format: "%+.2f", m.offset)).frame(width: 40)
+            Button("+") { m.offset += 0.25 }.help("Lyrics later")
+        }
+        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        .buttonStyle(.borderless)
+    }
+
+    @ViewBuilder var shuffleButton: some View {
+        if let s = m.extras.shuffle {
+            Button { m.send(.shuffle(!s)) } label: { Image(systemName: "shuffle") }
+                .foregroundStyle(s ? Color.primary : Color.secondary).opacity(s ? 1 : 0.6)
+                .help(s ? "Shuffle: on" : "Shuffle: off")
+        } else { Color.clear.frame(width: 24, height: 1) }
+    }
+
+    @ViewBuilder var repeatButton: some View {
+        if let r = m.extras.repeatMode {
+            Button { m.send(.repeatMode(m.nextRepeat)) } label: { Image(systemName: r == "one" ? "repeat.1" : "repeat") }
+                .foregroundStyle(r != "off" ? Color.primary : Color.secondary).opacity(r != "off" ? 1 : 0.6)
+                .help("Repeat: \(r)")
+        } else { Color.clear.frame(width: 24, height: 1) }
+    }
 
     var body: some View {
         let dur = max(m.track?.duration ?? 0, 1)
-        VStack(spacing: 6) {
+        VStack(spacing: big ? 18 : 6) {
             // Redraws only this bar twice a second instead of the whole window.
             TimelineView(.periodic(from: .now, by: 0.5)) { _ in
                 let pos = drag ?? min(m.position, dur)
-                HStack {
-                    Text(fmt(pos)).frame(width: 40, alignment: .leading)
-                    Slider(value: Binding(get: { pos }, set: { drag = $0 }), in: 0...(dur.isFinite ? dur : 1)) { editing in
-                        if !editing, let d = drag { m.send(.seek(d)); drag = nil }
-                    }
-                    .controlSize(.small)
-                    Text(fmt(dur)).frame(width: 40, alignment: .trailing)
-                }
-                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 24) {
-                if !m.lines.isEmpty {
-                    HStack(spacing: 2) {
-                        Button("−") { m.offset -= 0.25 }.help("Lyrics earlier")
-                        Text(String(format: "%+.2f", m.offset)).frame(width: 40)
-                        Button("+") { m.offset += 0.25 }.help("Lyrics later")
+                if big {
+                    VStack(spacing: 4) {
+                        scrubber(pos, dur)
+                        HStack { Text(fmt(pos)); Spacer(); Text("-" + fmt(max(dur - pos, 0))) }
                     }
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    .frame(width: 80, alignment: .leading)
-                } else { Spacer().frame(width: 80) }
+                } else {
+                    HStack {
+                        Text(fmt(pos)).frame(width: 40, alignment: .leading)
+                        scrubber(pos, dur)
+                        Text(fmt(dur)).frame(width: 40, alignment: .trailing)
+                    }
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: big ? 0 : 24) {
+                if big { shuffleButton; Spacer() }
+                else if !m.lines.isEmpty { offsetControl.frame(width: 80, alignment: .leading) }
+                else { Spacer().frame(width: 80) }
 
                 Button { m.send(.previous) } label: { Image(systemName: "backward.fill") }
-                Button { m.send(.playPause) } label: { Image(systemName: m.playing ? "pause.fill" : "play.fill").font(.title) }
-                    .keyboardShortcut(spaceKey ? KeyboardShortcut(.space, modifiers: []) : nil)
+                if big { Spacer() }
+                Button { m.send(.playPause) } label: {
+                    // Fixed frame: the play and pause symbols differ in size, which nudged the layout on every toggle.
+                    Image(systemName: m.playing ? "pause.fill" : "play.fill").font(big ? .system(size: 40) : .title)
+                        .frame(width: big ? 48 : 32, height: big ? 48 : 32)
+                }
+                .keyboardShortcut(spaceKey ? KeyboardShortcut(.space, modifiers: []) : nil)
+                if big { Spacer() }
                 Button { m.send(.next) } label: { Image(systemName: "forward.fill") }
 
-                Spacer().frame(width: 80)
+                if big { Spacer(); repeatButton } else { Spacer().frame(width: 80) }
             }
-            .font(.title3)
+            .font(big ? .title : .title3)
             .buttonStyle(.borderless)
+
+            if big {
+                if let v = m.extras.volume {
+                    HStack(spacing: 10) {
+                        Image(systemName: "speaker.fill")
+                        Slider(value: Binding(get: { vol ?? v }, set: { vol = $0 }), in: 0...100) { editing in
+                            if !editing, let x = vol { m.send(.volume(Int(x))); vol = nil }
+                        }
+                        .controlSize(.small)
+                        .tint(tint)
+                        Image(systemName: "speaker.wave.3.fill")
+                    }
+                    .font(.caption).foregroundStyle(.secondary)
+                }
+                if !m.lines.isEmpty { offsetControl }
+            }
         }
     }
 }
@@ -933,6 +1152,11 @@ func selfTest() {
     precondition(nthLine(in: song, equalTo: "La la", occurrence: 0) == 3)
     precondition(nthLine(in: song, equalTo: "La la", occurrence: 1) == 4)   // second chorus line, not the first
     precondition(nthLine(in: song, equalTo: "La la", occurrence: 2) == nil)
+    // Tint: a solid red image → red-ish hue, softened; solid grey → near white.
+    func solid(_ c: NSColor) -> NSImage { NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in c.setFill(); r.fill(); return true } }
+    let red = artTintHSB(solid(.red))!
+    precondition((red.h < 0.03 || red.h > 0.97) && red.s > 0.4 && red.b > 0.9, "\(red)")
+    precondition(artTintHSB(solid(.gray))!.s < 0.05)
     print("all tests passed")
 }
 
