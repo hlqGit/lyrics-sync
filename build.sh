@@ -12,7 +12,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>Lyrics</string>
   <key>CFBundleExecutable</key><string>Lyrics</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.1</string>
+  <key>CFBundleShortVersionString</key><string>0.2.2</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Lyrics reads what Music, Spotify or your browser is playing to show synced lyrics.</string>
 </dict></plist>
@@ -21,6 +21,8 @@ codesign -s - --force "$APP"
 echo "Built $APP"
 
 # Install: quit the running copy (unsaved editor work is lost), replace /Applications/Lyrics.app, reopen.
+# NO_INSTALL=1 ./build.sh just builds (e.g. for a release zip).
+[ -n "$NO_INSTALL" ] && exit 0
 pkill -x Lyrics && sleep 1 || true
 rm -rf /Applications/Lyrics.app
 ditto "$APP" /Applications/Lyrics.app

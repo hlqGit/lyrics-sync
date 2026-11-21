@@ -386,6 +386,10 @@ struct ContentView: View {
             Task { await Updater.shared.check() }
         }
         .onChange(of: onTop) { _, _ in setupWindows() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { n in
+            (n.object as? NSWindow)?.level = .normal
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in setupWindows() }
     }
 
     // MARK: pieces shared by both layouts
@@ -546,23 +550,17 @@ struct ContentView: View {
 
     // MARK: window
 
-    func toggleFullScreen() {
-        if onTop { onTop = false; setupWindows() }   // floating windows can't go full screen
-        (NSApp.keyWindow ?? NSApp.windows.first)?.toggleFullScreen(nil)
-    }
+    func toggleFullScreen() { (NSApp.keyWindow ?? NSApp.windows.first)?.toggleFullScreen(nil) }
 
+    /// Green button = real full screen, pinned or not. Pinning only changes the window level, and the level
+    /// drops to normal while in full screen (see the fullscreen notifications below).
     func setupWindows() {
         for w in NSApp.windows {
-            w.level = onTop ? .floating : .normal
+            w.level = onTop && !w.styleMask.contains(.fullScreen) ? .floating : .normal
             w.isOpaque = false
             w.backgroundColor = .clear
-            if onTop {
-                w.collectionBehavior.remove(.fullScreenPrimary)
-                w.collectionBehavior.formUnion([.canJoinAllSpaces, .fullScreenAuxiliary])
-            } else {
-                w.collectionBehavior.subtract([.canJoinAllSpaces, .fullScreenAuxiliary])
-                w.collectionBehavior.insert(.fullScreenPrimary)
-            }
+            w.collectionBehavior.subtract([.canJoinAllSpaces, .fullScreenAuxiliary])   // these make green = zoom
+            w.collectionBehavior.insert(.fullScreenPrimary)
         }
     }
 }
