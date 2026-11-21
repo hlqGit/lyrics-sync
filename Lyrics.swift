@@ -235,6 +235,7 @@ func fetchLyrics(_ t: Track) async -> LR? {
     @Published var track: Track?
     @Published var lines: [Line] = []
     @Published var plain: String?
+    var sourcePlain: String?   // LRCLIB's plain lyrics even when synced ones are shown; seeds the editor
     @Published var status = "Play something in Music, Spotify or YouTube…"
     @Published var current = -1
     @Published var offset = 0.0
@@ -296,7 +297,7 @@ func fetchLyrics(_ t: Track) async -> LR? {
     }
 
     private func load(_ t: Track) {
-        lines = []; plain = nil; current = -1; offset = 0; art = nil; artTint = nil
+        lines = []; plain = nil; sourcePlain = nil; current = -1; offset = 0; art = nil; artTint = nil
         stash = nil   // song changed mid-preview: don't restore the old song's lyrics later
         status = "Searching lyrics…"
         Task {
@@ -312,6 +313,7 @@ func fetchLyrics(_ t: Track) async -> LR? {
             if let c = cache[t.key] { r = c } else { r = await fetchLyrics(t); if r != nil { cache[t.key] = r } }
             guard track?.key == t.key else { return }
             lines = r?.syncedLyrics.map(parseLRC) ?? []
+            sourcePlain = r?.plainLyrics
             plain = lines.isEmpty ? r?.plainLyrics : nil
             status = r == nil ? "No lyrics found for \(t.artist) – \(t.title)" : ""
         }
@@ -327,7 +329,7 @@ func fetchLyrics(_ t: Track) async -> LR? {
     func useLyrics(key: String, synced: String, plain: String) {
         cache[key] = LR(duration: track?.duration, syncedLyrics: synced, plainLyrics: plain)
         guard track?.key == key else { return }
-        lines = parseLRC(synced); self.plain = nil; status = ""
+        lines = parseLRC(synced); self.plain = nil; sourcePlain = plain; status = ""
     }
 
     /// off → all → one → off (Spotify has no "one", so off ↔ all).
@@ -391,8 +393,10 @@ struct ContentView: View {
         .frame(minWidth: 300, minHeight: 320)
         .onAppear {
             setupWindows()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { setupWindows() }   // after SwiftUI's own window setup
             Task { await Updater.shared.check() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in setupWindows() }
         .onChange(of: onTop) { _, _ in setupWindows() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willEnterFullScreenNotification)) { n in
             (n.object as? NSWindow)?.level = .normal
@@ -562,12 +566,14 @@ struct ContentView: View {
 
     /// Green button = real full screen, pinned or not. Pinning only changes the window level, and the level
     /// drops to normal while in full screen (see the fullscreen notifications below).
+    /// SwiftUI marks the window .fullScreenNone and strips .fullScreenPrimary during its own setup after onAppear
+    /// (measured: behavior 66176 → 66048, green = zoom), so this also runs after that and on every activation.
     func setupWindows() {
-        for w in NSApp.windows {
+        for w in NSApp.windows where w.standardWindowButton(.zoomButton) != nil {
             w.level = onTop && !w.styleMask.contains(.fullScreen) ? .floating : .normal
             w.isOpaque = false
             w.backgroundColor = .clear
-            w.collectionBehavior.subtract([.canJoinAllSpaces, .fullScreenAuxiliary])   // these make green = zoom
+            w.collectionBehavior.subtract([.canJoinAllSpaces, .fullScreenAuxiliary, .fullScreenNone])   // all make green = zoom
             w.collectionBehavior.insert(.fullScreenPrimary)
         }
     }
@@ -766,7 +772,14 @@ func lrclibPost(_ path: String, body: [String: Any]?, token: String?) async thro
         self.m = m
         track = m.track!
         title = track.title; artist = track.artist; album = track.album
-        text = m.plain ?? m.lines.map { $0.text.isEmpty ? note : $0.text }.joined(separator: "\n")
+        guard !m.lines.isEmpty else { text = m.plain ?? ""; return }
+        // Song already has synced lyrics: open in review with its timings (plus any −/+ shift the player had),
+        // so you can tweak lines instead of resyncing. "Start over" still resyncs from scratch.
+        let loaded = m.lines.map { $0.text.isEmpty ? note : $0.text }
+        text = m.sourcePlain ?? loaded.filter { $0 != note }.joined(separator: "\n")
+        lines = loaded
+        stamps = m.lines.map { max(0, $0.time + m.offset) }
+        phase = .review
     }
 
     var idx: Int { fixing ?? stamps.count }
