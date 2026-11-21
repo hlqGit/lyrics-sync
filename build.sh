@@ -12,7 +12,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>Lyrics</string>
   <key>CFBundleExecutable</key><string>Lyrics</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.2</string>
+  <key>CFBundleShortVersionString</key><string>0.2.3</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Lyrics reads what Music, Spotify or your browser is playing to show synced lyrics.</string>
 </dict></plist>

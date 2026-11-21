@@ -210,7 +210,14 @@ func fetchLyrics(_ t: Track) async -> LR? {
     var q = ["track_name": t.title, "artist_name": t.artist]
     if !t.album.isEmpty { q["album_name"] = t.album }
     if t.duration > 0 { q["duration"] = String(Int(t.duration.rounded())) }
-    if let d = await lrclib("get", q), let r = try? JSONDecoder().decode(LR.self, from: d), r.syncedLyrics != nil { return r }
+    // LRCLIB remembers a miss for an exact query for a while: a song looked up while you were syncing it keeps
+    // answering "not found" at its duration after you publish (seen: 157 → 404, 156/158 → 200). Asking again
+    // without the duration (still exact title/artist/album) gets past that.
+    var exact = [q]
+    if q["duration"] != nil { var n = q; n["duration"] = nil; exact.append(n) }
+    for q in exact {
+        if let d = await lrclib("get", q), let r = try? JSONDecoder().decode(LR.self, from: d), r.syncedLyrics != nil { return r }
+    }
 
     var plainHit: LR?
     for q in [["track_name": clean(t.title), "artist_name": t.artist], ["q": "\(t.artist) \(clean(t.title))"]] {
@@ -301,7 +308,8 @@ func fetchLyrics(_ t: Track) async -> LR? {
         }
         Task {
             let r: LR?
-            if let c = cache[t.key] { r = c } else { r = await fetchLyrics(t); cache[t.key] = r }
+            // Only hits are cached, so lyrics published mid-session show up next time the song plays.
+            if let c = cache[t.key] { r = c } else { r = await fetchLyrics(t); if r != nil { cache[t.key] = r } }
             guard track?.key == t.key else { return }
             lines = r?.syncedLyrics.map(parseLRC) ?? []
             plain = lines.isEmpty ? r?.plainLyrics : nil
