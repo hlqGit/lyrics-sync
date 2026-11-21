@@ -381,7 +381,10 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 300, minHeight: 320)
-        .onAppear { setupWindows() }
+        .onAppear {
+            setupWindows()
+            Task { await Updater.shared.check() }
+        }
         .onChange(of: onTop) { _, _ in setupWindows() }
     }
 
@@ -480,6 +483,7 @@ struct ContentView: View {
             }
             .padding(.horizontal, 16).padding(.top, 30).padding(.bottom, 8)
 
+            UpdateBanner()
             previewBanner
             if let e = editor, !previewing {
                 EditorView(e: e, m: m, close: { editor = nil }, preview: { m.preview(e.lrc); previewing = true })
@@ -515,6 +519,7 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             VStack(spacing: 0) {
                 HStack { Spacer(); toolbarButtons }.padding(.horizontal, 20).padding(.top, 12)
+                UpdateBanner()
                 previewBanner
             }
         }
@@ -671,6 +676,11 @@ struct LyricsApp: App {
         WindowGroup { ContentView() }
             .windowStyle(.hiddenTitleBar)
             .defaultSize(width: 420, height: 620)
+            .commands {
+                CommandGroup(after: .appInfo) {
+                    Button("Check for Updates…") { Task { await Updater.shared.check(manual: true) } }
+                }
+            }
     }
 }
 
@@ -1126,6 +1136,116 @@ struct TipsView: View {
     }
 }
 
+// MARK: - Updates (GitHub Releases)
+
+let repo = "hlqGit/lyrics-sync"
+
+/// "v0.3.0" vs "0.2.0", compared numerically per component.
+func isNewer(_ a: String, than b: String) -> Bool {
+    func parts(_ s: String) -> [Int] { s.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).split(separator: ".").map { Int($0) ?? 0 } }
+    let x = parts(a), y = parts(b)
+    for i in 0..<max(x.count, y.count) {
+        let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+        if p != q { return p > q }
+    }
+    return false
+}
+
+func runTool(_ exe: String, _ args: [String]) throws {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe); p.arguments = args
+    try p.run(); p.waitUntilExit()
+    guard p.terminationStatus == 0 else { throw Msg(errorDescription: "\((exe as NSString).lastPathComponent) failed") }
+}
+
+@MainActor final class Updater: ObservableObject {
+    static let shared = Updater()
+    @Published var available: String?   // newer version, e.g. "0.3.0"
+    @Published var status = ""
+    private var zipURL: URL?
+    let current = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+
+    func check(manual: Bool = false) async {
+        struct Rel: Decodable {
+            struct Asset: Decodable { let name: String; let browser_download_url: URL }
+            let tag_name: String; let assets: [Asset]
+        }
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("LyricsSync", forHTTPHeaderField: "User-Agent")
+        guard let (d, _) = try? await URLSession.shared.data(for: req),
+              let r = try? JSONDecoder().decode(Rel.self, from: d) else {
+            if manual { status = "Couldn't check for updates" }
+            return
+        }
+        if isNewer(r.tag_name, than: current), let a = r.assets.first(where: { $0.name.hasSuffix(".zip") }) {
+            available = r.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            zipURL = a.browser_download_url
+            status = ""
+        } else if manual {
+            status = "You're up to date (\(current))"
+        }
+    }
+
+    /// Download, unzip, check it's really Lyrics, then quit; a tiny shell script swaps the bundle and relaunches.
+    func install() async {
+        guard let zipURL else { return }
+        let target = Bundle.main.bundlePath
+        guard FileManager.default.isWritableFile(atPath: (target as NSString).deletingLastPathComponent) else {
+            status = "Can't write to \((target as NSString).deletingLastPathComponent)"; return
+        }
+        status = "Downloading…"
+        do {
+            let (zip, _) = try await URLSession.shared.download(from: zipURL)
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("lyrics-update-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try runTool("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path])
+            let newApp = dir.appendingPathComponent("Lyrics.app")
+            guard Bundle(url: newApp)?.bundleIdentifier == Bundle.main.bundleIdentifier else {
+                throw Msg(errorDescription: "download didn't contain Lyrics.app")
+            }
+            // Wait for this process to exit, move the old app aside, move the new one in (restore the old one if
+            // that fails), then reopen.
+            let script = """
+            while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done
+            rm -rf "$1.old"
+            if mv "$1" "$1.old" && mv "$2" "$1"; then rm -rf "$1.old"; else [ -e "$1" ] || mv "$1.old" "$1"; fi
+            open "$1"
+            """
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", script, "sh", target, newApp.path]
+            try p.run()
+            NSApp.terminate(nil)
+        } catch {
+            status = "Update failed: \(error.localizedDescription)"
+        }
+    }
+}
+
+struct UpdateBanner: View {
+    @ObservedObject var u = Updater.shared
+
+    var body: some View {
+        if u.available != nil || !u.status.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.down.circle.fill")
+                Text(u.available.map { "Lyrics \($0) is available" } ?? u.status).font(.caption.bold())
+                Spacer()
+                if u.available != nil {
+                    if !u.status.isEmpty { Text(u.status).font(.caption).lineLimit(1) }
+                    Button("Update & Restart") { Task { await u.install() } }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                        .disabled(u.status == "Downloading…")
+                } else {
+                    Button("OK") { u.status = "" }.controlSize(.small)
+                }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.15))
+        }
+    }
+}
+
 // MARK: - Entry + self-check
 
 func selfTest() {
@@ -1157,6 +1277,8 @@ func selfTest() {
     let red = artTintHSB(solid(.red))!
     precondition((red.h < 0.03 || red.h > 0.97) && red.s > 0.4 && red.b > 0.9, "\(red)")
     precondition(artTintHSB(solid(.gray))!.s < 0.05)
+    precondition(isNewer("v0.3.0", than: "0.2.0") && isNewer("0.10.0", than: "0.9.1") && isNewer("1.0", than: "0.9.9"))
+    precondition(!isNewer("v0.2.0", than: "0.2.0") && !isNewer("0.2", than: "0.2.0") && !isNewer("0.1.9", than: "0.2.0"))
     print("all tests passed")
 }
 
